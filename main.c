@@ -6,10 +6,13 @@
 int main() {
   gpio_init();
   usb_init();
-
-  char data[64];
-  usb_write_dbl(0x82, data, 64);
+  char buffer[64];
+  buffer[0] = 0;
   while(1) {
-  	usb_write_dbl(0x82, data, 64);
-  }
+  	usb_main_loop();
+  	if(usb_ready() && usb_tx_ready(0x82)) {
+			usb_write_dbl(0x82, buffer, 64);
+			buffer[0]++;
+		}
+	}
 }

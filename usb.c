@@ -6,6 +6,28 @@
 #include "gpio.h"
 
 uint8_t pending_addr = 0;
+uint8_t usb_initialized;
+int8_t tx_ready;
+
+uint8_t usb_tx_ready(uint8_t ep) {
+  ep &= 0xf;
+  uint32_t epr = USB_EPR(ep);
+  if((epr & 0x30) == 0x30) {
+    // READY, transmit unless SW_BUF == DTOG
+    if((epr & 0x4000) != ((epr & 0x40) << 8)) {
+      return(1); // Free buffer available
+    } else {
+      return(0); // All buffers full
+    }
+  } else {
+    // NAK, always transmit
+    return(1);
+  }
+}
+
+uint8_t usb_ready() {
+  return(usb_initialized);
+}
 
 void usb_init() {
   gpio_port_mode(GPIOA, 11, 2, 10, 0, 0); // A11 AF10
@@ -26,16 +48,14 @@ void usb_init() {
   PWR->CR2 |= (1<<10);
   usleep(10);
 
-  // Enable USB
-  USB->CNTR &= ~USB_CNTR_PDWN;
+  // Enable USB and reset
+  USB->CNTR = USB_CNTR_FRES;
   usleep(10);
-  USB->CNTR &= ~USB_CNTR_FRES;
+  // Deassert reset
+  USB->CNTR = 0;
   usleep(10);
-  USB->ISTR = 0;
-  USB->CNTR |= USB_CNTR_RESETM;
+  // Activate DP pullup
   USB->BCDR |= USB_BCDR_DPPU;
-
-  NVIC->ISER[2] |= (1 << (USB_IRQn - 64));
 }
 
 uint32_t buffer_pointer;
@@ -53,10 +73,12 @@ void usb_configure_ep(uint8_t ep, uint32_t type) {
 
   if(in || ep == 0) {
     USBBUFTABLE->ep_desc[ep].txBufferAddr = buffer_pointer;
+    USBBUFTABLE->ep_desc[ep].txBufferCount = 0;
     buffer_pointer += 64;
     if(dblbuf) {
       // Use RX buffer as additional TX buffer
       USBBUFTABLE->ep_desc[ep].rxBufferAddr = buffer_pointer;
+      USBBUFTABLE->ep_desc[ep].rxBufferCount = 0;
       buffer_pointer += 64;
       new_epr |= (old_epr & 0x4040); // DTOG=0, SW_BUF=0
     }
@@ -75,32 +97,21 @@ void usb_configure_ep(uint8_t ep, uint32_t type) {
       buffer_pointer += 64;
       new_epr |= (old_epr & 0x4040); // DTOG=0, SW_BUF=0
     }
-
     new_epr |= (old_epr & 0x3000) ^ 0x3000; // Ready
   }
 
   USB_EPR(ep) = new_epr;
 }
-uint32_t ep_tx_ready(uint32_t ep) {
-  ep &= 0x7f;
-  return((USB_EPR(ep) & 0x30) == 0x20);
-}
-
-uint32_t ep_rx_ready(uint32_t ep) {
-  ep &= 0x7f;
-  return((USB_EPR(ep) & 0x3000) == 0x2000);
-}
 
 void usb_read(uint8_t ep, volatile char * buffer) {
   ep &= 0x7f;
-  while(!ep_rx_ready(ep));
   uint32_t rxBufferAddr = USBBUFTABLE->ep_desc[ep].rxBufferAddr;
   uint32_t len = USBBUFTABLE->ep_desc[ep].rxBufferCount & 0x03ff;
   for(int n=0; n<len; n+=2) {
     *(uint16_t *)(buffer + n) = *(uint16_t *)(USBBUFRAW+rxBufferAddr+n);
   }
-  // Clear CTR_RX and toggle NAK->VALID
-  USB_EPR(ep) = (USB_EPR(ep) & 0x378f) ^ 0x3000;
+  // RX NAK->VALID
+  USB_EPR(ep) = (USB_EPR(ep) & 0xb78f) ^ 0x3000;
 }
 
 void usb_read_dbl(uint8_t ep, volatile char * buffer) {
@@ -125,21 +136,19 @@ void usb_read_dbl(uint8_t ep, volatile char * buffer) {
 
 void usb_write(uint8_t ep, volatile char * buffer, uint32_t len) {
   ep &= 0x7f;
-  while(!ep_tx_ready(ep));
   uint32_t txBufferAddr = USBBUFTABLE->ep_desc[ep].txBufferAddr;
   for(int n=0; n<len; n+=2) {
     *(volatile uint16_t *)(USBBUFRAW+txBufferAddr+n) = *(uint16_t *)(buffer + n);
   }
   USBBUFTABLE->ep_desc[ep].txBufferCount = len;
 
-  // Toggle NAK->VALID
+  // TX NAK->VALID
   USB_EPR(ep) = (USB_EPR(ep) & 0x87bf) ^ 0x30;
 }
 
 void usb_write_dbl(uint8_t ep, volatile char * buffer, uint32_t len) {
   ep &= 0x7f;
 
-  while((USB_EPR(ep) & 0x30) == 0x30 && (((USB_EPR(ep) & 0x4000) >> 8) == (USB_EPR(ep) & 0x40)));
   uint32_t txBufferAddr;
 
   if(USB_EPR(ep) & 0x4000) {
@@ -158,9 +167,12 @@ void usb_write_dbl(uint8_t ep, volatile char * buffer, uint32_t len) {
     USBBUFTABLE->ep_desc[ep].txBufferCount = len;
   }
 
-  // Toggle SW_BUF
-  USB_EPR(ep) = (USB_EPR(ep) & 0x87bf) ^ 0x30;
+  // Toggle TX SW_BUF
   USB_EPR(ep) = (USB_EPR(ep) & 0x878f) | 0x4000;
+
+  if((USB_EPR(ep) & 0x0030) == 0x20) // TX is NAK
+    if((USB_EPR(ep) & 0x4000) == ((USB_EPR(ep) & 0x40) << 8)) // Both buffers full
+      USB_EPR(ep) = (USB_EPR(ep) & 0x87bf) ^ 0x30; // Set TX VALID
 }
 
 void usb_reset() {
@@ -170,6 +182,8 @@ void usb_reset() {
   usb_configure_ep(0, 1);
   usb_configure_ep(0x01, 0x10);
   usb_configure_ep(0x82, 0x10);
+  tx_ready = 0;
+  usb_initialized = 0;
 
   USB->BTABLE = 0;
 
@@ -177,7 +191,7 @@ void usb_reset() {
   USB->DADDR = USB_DADDR_EF;
 }
 
-void handle_ep0() {
+void usb_handle_ep0() {
   char packet[64];
   usb_read(0, packet);
 
@@ -208,35 +222,36 @@ void handle_ep0() {
   // Set configuration
   if(bmRequestType == 0x00 && bRequest == 0x09) {
     usb_write(0,0,0);
+    usb_initialized = 1;
   }
 
 }
 
-void USB_IRQHandler() {
-  int istr = USB->ISTR;
-
-  if(istr & USB_ISTR_RESET) {
+void usb_main_loop() {
+  // USB reset
+  if(USB->ISTR & USB_ISTR_RESET) {
     usb_reset();
   }
 
-  if(istr & USB_ISTR_CTR) {
-    uint32_t ep = istr & 0xf;
-    if(istr & 0x10) {
-      // RX
-      if(ep == 0) {
-        handle_ep0();
-      } else if (ep == 1){
-        char packet[64];
-        usb_read_dbl(ep, packet);
-      }
-      USB_EPR(ep) &= 0x078f;
-    } else {
-      // TX
-      if(pending_addr) {
-        USB->DADDR = USB_DADDR_EF | pending_addr;
-        pending_addr = 0;
-      }
-      USB_EPR(ep) &= 0x870f;
-    }
+  if(USB_EPR(0) & (1<<15)) {
+    // EP0 RX
+    USB_EPR(0) &= 0x078f;
+    usb_handle_ep0();
   }
+
+  if(USB_EPR(0) & (1<<7)) {
+    // EP0 TX
+    if(pending_addr) {
+      USB->DADDR = USB_DADDR_EF | pending_addr;
+      pending_addr = 0;
+    }
+    // Clear pending state
+    USB_EPR(0) &= 0x870f;
+  }
+
+  if(USB_EPR(2) & (1<<7)) {
+    // Clear pending state
+    USB_EPR(2) &= 0x870f;
+  }
+
 }

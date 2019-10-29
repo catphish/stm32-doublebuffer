@@ -9,6 +9,14 @@ uint8_t pending_addr = 0;
 uint8_t usb_initialized;
 int8_t tx_ready;
 
+uint8_t usb_rx_ready(uint8_t ep) {
+  ep &= 0xf;
+  if(USB_EPR(ep) & (1<<15))
+    return(1);
+  else
+    return(0);
+}
+
 uint8_t usb_tx_ready(uint8_t ep) {
   ep &= 0xf;
   uint32_t epr = USB_EPR(ep);
@@ -116,6 +124,9 @@ void usb_read(uint8_t ep, volatile char * buffer) {
 
 void usb_read_dbl(uint8_t ep, volatile char * buffer) {
   ep &= 0x7f;
+
+  // Clear flag
+  USB_EPR(ep) &= 0x078f;
 
   uint32_t len, rxBufferAddr;
 
@@ -248,10 +259,4 @@ void usb_main_loop() {
     // Clear pending state
     USB_EPR(0) &= 0x870f;
   }
-
-  if(USB_EPR(2) & (1<<7)) {
-    // Clear pending state
-    USB_EPR(2) &= 0x870f;
-  }
-
 }

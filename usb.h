@@ -14,6 +14,8 @@ struct USBBufTable {
 
 void usb_init();
 void usb_main_loop();
-void usb_write_dbl(uint8_t ep, volatile char * buffer, uint32_t len);
-uint8_t usb_tx_ready(uint8_t ep);
 uint8_t usb_ready();
+uint8_t usb_rx_ready(uint8_t ep);
+uint8_t usb_tx_ready(uint8_t ep);
+void usb_read_dbl(uint8_t ep, volatile char * buffer);
+void usb_write_dbl(uint8_t ep, volatile char * buffer, uint32_t len);
